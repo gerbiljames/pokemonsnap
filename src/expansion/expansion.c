@@ -2,6 +2,7 @@
 #include "more_funcs/more_funcs.h"
 #include "app_level/app_level.h"
 #include "photo_check/photo_check.h"
+#include "camera_check/camera_check.h"
 #include "sys/render.h"
 #include "PR/os_flash.h"
 #include "apdata.h"
@@ -21,6 +22,13 @@
 #define TECHNIQUE_SCORE 6
 #define MULTIPLE_SCORE  7
 #define MULTIPLE_WO_TECHNIQUE 8
+
+// run events
+#define EVENT_POKEMON_FOOD            0
+#define EVENT_POKE_FLUTE              1
+#define EVENT_PESTER_BALL             2
+#define EVENT_DASH_ENGINE_ACTIVATED   3
+#define EVENT_DASH_ENGINE_DEACTIVATED 4
 
 // dialog flag bits
 #define DIALOG_RAINBOW_CLOUD 0x0001
@@ -155,6 +163,11 @@ extern SObj* D_803B0A14_550E24;
 extern SObj* D_803B0A18_550E28;
 extern SObj* D_803B0A1C_550E2C;
 
+// Camera check
+extern PhotoData D_800B0598[60];
+extern Unk803A6C18* func_8037452C_847CDC(PhotoData* arg0);
+extern UIElement* D_camera_check_80249910;
+
 extern s32 IsCartStopped;
 
 extern u16 gContInputCurrentButtons;
@@ -196,6 +209,13 @@ extern u32 gDialogRequestFlags;
 extern u32 gDialogPlayedFlags;
 extern u32 gCameraInversionYAMLOption;
 extern u32 gCameraInversionApplied;
+
+// Internal globals
+
+// Which rawPhotoScores entry exp_CalculateScore writes to. Only points at a real
+// roll entry while exp_processPhoto is scoring that photo
+s32 rollIndex = 60;
+u8 exp_snappedPoses[60];
 
 /*************************
  ** Expansion functions ** 
@@ -249,6 +269,19 @@ s32 exp_hasSignDetector(void) {
 s32 exp_tutorialDone(void) {
     D_800C21B0_5F050->data.hasFinishedTutorial = 1;
     return 4;
+}
+
+extern u32 runFrameStart;
+extern u32 runEventCount;
+extern ApRunEvent runEvents[256];
+
+void recordRunEvent(int itemId) {
+    ApRunEvent *runEvent = &runEvents[runEventCount];
+    if (runEventCount == 256) return;
+    runEventCount += 1;
+
+    runEvent->frame = (gtlDrawnFrameCounter - runFrameStart);
+    runEvent->type = itemId;
 }
 
 void exp_handleItemButtonsPress(GObj* obj) {
@@ -305,6 +338,7 @@ void exp_handleItemButtonsPress(GObj* obj) {
         if ((gContInputPressedButtons & D_CBUTTONS) &&
             exp_canUse(POKE_FLUTE, D_800C21B0_5F050->data.canUseFlute) && PressPokeFluteTimeout == 0) {
             LastItemId = ITEM_ID_POKEFLUTE;
+            recordRunEvent(EVENT_POKE_FLUTE);
             PressPokeFluteTimeout = 45;
             Icons_ProcessButtonPress(ITEM_ID_POKEFLUTE);
             Items_PlayPokeFlute();
@@ -313,6 +347,7 @@ void exp_handleItemButtonsPress(GObj* obj) {
                 exp_canUse(PESTER_BALL, D_800C21B0_5F050->data.canUsePesterBall)) {
                 LastItemId = ITEM_ID_PESTER_BALL;
                 ThrowItemTimeout = 45;
+                recordRunEvent(EVENT_PESTER_BALL);
                 Items_SpawnPesterBall(&gMainCamera->viewMtx.lookAt.eye, &PlayerVelocity);
                 Icons_ProcessButtonPress(ITEM_ID_PESTER_BALL);
                 Items_StopPokeFlute();
@@ -321,6 +356,7 @@ void exp_handleItemButtonsPress(GObj* obj) {
             } else if ((gContInputPressedButtons & A_BUTTON) &&
                        exp_canUse(POKEMON_FOOD, D_800C21B0_5F050->data.canUseApple)) {
                 LastItemId = ITEM_ID_APPLE;
+                recordRunEvent(EVENT_POKEMON_FOOD);
                 ThrowItemTimeout = 45;
                 Items_SpawnApple(&gMainCamera->viewMtx.lookAt.eye, &PlayerVelocity);
                 Icons_ProcessButtonPress(ITEM_ID_APPLE);
@@ -328,6 +364,12 @@ void exp_handleItemButtonsPress(GObj* obj) {
                 Icons_ProcessButtonPress(-1);
                 PressPokeFluteTimeout = 0;
             }
+        }
+        if ((gContInputPressedButtons & R_TRIG) && exp_dashAvailable()) {
+            recordRunEvent(EVENT_DASH_ENGINE_ACTIVATED);
+        }
+        if ((gContInputReleasedButtons & R_TRIG) && exp_dashAvailable()) {
+            recordRunEvent(EVENT_DASH_ENGINE_DEACTIVATED);
         }
     }
     if (ThrowItemTimeout > 0) {
@@ -378,6 +420,7 @@ s32 exp_filmUpdateCounter(void) {
 // Replaces Icons_Init to enable all the item icons on level start.
 // This way, when an item is received mid-level, trying to show or
 // animate its icon doesn't crash the game.
+// Also is used as "started level" hook
 void exp_Icons_Init(void) {
     GObj* gobj;
     s32 i;
@@ -387,6 +430,9 @@ void exp_Icons_Init(void) {
     s32 apple  = exp_canUse(POKEMON_FOOD, D_800C21B0_5F050->data.canUseApple);
     s32 pester = exp_canUse(PESTER_BALL, D_800C21B0_5F050->data.canUsePesterBall);
     s32 flute  = exp_canUse(POKE_FLUTE, D_800C21B0_5F050->data.canUseFlute);
+
+    runFrameStart = gtlDrawnFrameCounter;
+    runEventCount = 0;
 
     progressFlags = getProgressFlags();
     Icons_ItemFlags = PF_HAS_APPLE | PF_HAS_PESTER_BALL | PF_HAS_FLUTE;
@@ -834,10 +880,12 @@ static s32 getSpeciesSlot(s32 pokemonID, s32 levelID) {
 // we record each species' best bonus values into the AP block.
 //   Index 0: Special Score (e.g. 1000 for Surfing Pikachu)
 //   Index 1: Pose Score
-//   Index 2: Size Score
-//   Index 3: Technique Score (0 = Normal, 1 = Wonderful)
-//   Index 4: Same Pokemon Score
-//   Index 5: Bit field containing special pose IDs
+//   Index 2: Most recent pose ID
+//   Index 3: Size Score
+//   Index 4: Technique Score (0 = Normal, 1 = Wonderful)
+//   Index 5: Same Pokemon Score
+//   Index 6: Bit field containing special pose IDs
+//   Index 7: Total score
 //     Special Pose IDs range from 1 to 12 (inclusive)  
 //     and are mapped to bits 0 to 11 of index 5
 //       1: Surfing Pikachu      7: Gust-Using Pidgey
@@ -870,8 +918,9 @@ s32 exp_registerPhoto(Photo* photo) {
         // Eventually this could be reduced to bit flags, if needed.
         score->specialScore  = max(score->specialScore, photo->specialBonus);
         score->poseScore     = max(score->poseScore, photo->posePts);
+        score->lastPoseId    = photo->poseID;
         score->sizeScore     = max(score->sizeScore, photo->proximityScore);
-        score->isWellFramed  = photo->isWellFramed;
+        score->isWellFramed |= photo->isWellFramed;
         score->samePkmnBonus = max(score->samePkmnBonus, photo->samePkmnBonus);
         score->totalScore    = max(score->totalScore, photo->totalScore);
         
@@ -1210,6 +1259,10 @@ void exp_Pause_UpdateSelection(GObj* obj) {
     }
 }
 
+extern ApRawPhotoScore rawPhotoScores[61];
+extern u32 photoRollCount;
+extern u32 photosWritten;
+
 void exp_CalculateScore(ScoreData* score, PhotoData* photo, s32 id) {
     s32 pkmnID;
     s32 visiblePixels;
@@ -1226,6 +1279,10 @@ void exp_CalculateScore(ScoreData* score, PhotoData* photo, s32 id) {
     f32 sizeScore;
     f32 tmp7;
     f32 tmp8;
+    ApRawPhotoScore* rawScore;
+
+    if (!(0 <= rollIndex && rollIndex < 60)) rollIndex = 60;
+    rawScore = &rawPhotoScores[rollIndex];
 
     score->totalScore = 0;
 
@@ -1242,11 +1299,17 @@ void exp_CalculateScore(ScoreData* score, PhotoData* photo, s32 id) {
         return;
     }
 
+    // Need to add 1 because slot IDs are 1-indexed so that 0 == no pokemon
+    rawScore->speciesSlotId = getSpeciesSlot(score->pokemonInFocus, photo->levelID) + 1;
+
     specialID = photo->pokemons[idx].specialID;
     if (specialID > 0) {
         score->specialID = specialID;
         score->specialBonus = score_SpecialBonuses[specialID];
         score->totalScore += score->specialBonus;
+
+        rawScore->specialPoseId = specialID;
+        rawScore->totalScore += score->specialBonus;
     }
 
     visiblePixels = score_PixelCountUnobstructed[id];
@@ -1276,18 +1339,19 @@ void exp_CalculateScore(ScoreData* score, PhotoData* photo, s32 id) {
     roundedSizeScore = ((u16) ((sizeScore + 5.0f) / 10.0f)) * 10;
     score->totalScore += roundedSizeScore;
 
+    rawScore->sizeScore = roundedSizeScore;
+    rawScore->totalScore += roundedSizeScore;
+
     if (visiblePixelScore < 0.245f || visiblePart < 0.6f) {
         return;
     }
 
     poseID = photo->pokemons[idx].poseID;
     score->poseID = poseID;
+    rawScore->poseId = poseID;
     if (poseID > 0) {
         score->posePts = score_PoseBonuses[poseID];
         score->totalScore += score->posePts;
-        if (score->posePts < 200) {
-            return;
-        }
     } else {
         f22 = photo->pokemons[idx].yaw - atan2f(photo->unk_08.x - photo->unk_14.x, photo->unk_08.z - photo->unk_14.z);
         while (f22 > PI) {
@@ -1304,23 +1368,36 @@ void exp_CalculateScore(ScoreData* score, PhotoData* photo, s32 id) {
         tmp2 = f22 * 180.0f / PI / 15.0f;
         score->posePts = D_800AE6E4[tmp4][tmp2];
         score->totalScore += score->posePts;
-        if (score->posePts < 200) {
-            return;
+    }
+
+    rawScore->poseScore = score->posePts;
+    rawScore->totalScore += score->posePts;
+
+    if (score->posePts < 200) {
+        return;
+    }
+
+    if (score_PixelCountInCenter[id] != 0) {
+        rawScore->goodTechnique = 1;
+        rawScore->totalScore *= 2;
+
+        if (exp_canUse(TECHNIQUE_SCORE, 0)) {
+            score->isWellFramed = true;
+            score->totalScore *= 2;
         }
     }
 
-    if (score_PixelCountInCenter[id] != 0 && exp_canUse(TECHNIQUE_SCORE, 0)) {
-        score->isWellFramed = true;
-        score->totalScore *= 2;
-    }
+    // Calculate the same pokemon bonus, then decide whether or not to keep it
+    for (i = 0; i < id; i++)                      score_AddSamePkmnBonus(score, photo, i, pkmnID);
+    for (i = id + 1; i < score_PokemonCount; i++) score_AddSamePkmnBonus(score, photo, i, pkmnID);
 
-    if (exp_canUse(MULTIPLE_SCORE, 0) && (score->isWellFramed || exp_canUse(MULTIPLE_WO_TECHNIQUE, 0))) {
-        for (i = 0; i < id; i++) {
-            score_AddSamePkmnBonus(score, photo, i, pkmnID);
-        }
-        for (i = id + 1; i < score_PokemonCount; i++) {
-            score_AddSamePkmnBonus(score, photo, i, pkmnID);
-        }
+    rawScore->multipleScore = score->samePkmnBonus;
+    rawScore->totalScore += score->samePkmnBonus;
+
+    if (!(exp_canUse(MULTIPLE_SCORE, 0) && (score->isWellFramed || exp_canUse(MULTIPLE_WO_TECHNIQUE, 0)))) {
+        score->totalScore -= score->samePkmnBonus;
+        score->samePkmnBonus = 0;
+        score->samePkmnNumber = 0;
     }
 }
 
@@ -1332,4 +1409,233 @@ void exp_photocheck_skipGoodTechniqueChastising(UIElement* el, char* str) {
 
 s32 exp_photocheck_autoPressA(UIElement* arg0, s32 arg1) {
     return A_BUTTON;
+}
+
+extern s32 makePhoto(GObj* pokemonObj);
+
+s32 exp_makePhoto(GObj* pokemonObj) {
+    s32 index = func_8009BC68();          // gPhotoCount before the call = the slot makePhoto writes
+    rawPhotoScores[index].frame = (gtlDrawnFrameCounter - runFrameStart);
+    return makePhoto(pokemonObj);
+}
+
+Unk803A6C18* exp_processPhoto(PhotoData* photoData) {
+    Unk803A6C18* ret;
+
+    rollIndex = photoData - D_800B0598;
+    if (0 <= rollIndex && rollIndex < 60) {
+        ApRawPhotoScore* rawScore = &rawPhotoScores[rollIndex];
+        rawScore->totalScore = rawScore->sizeScore = rawScore->poseScore = rawScore->multipleScore = 0;
+        rawScore->specialPoseId = rawScore->poseId = rawScore->goodTechnique = 0;
+        rawScore->speciesSlotId = 0;
+        rawScore->levelId = photoData->levelID;
+    }
+
+    ret = func_8037452C_847CDC(photoData);
+    if (ret != NULL && 0 <= rollIndex && rollIndex < 60) {
+        if (ret->score.pokemonInFocus > 0) exp_snappedPoses[rollIndex] = ret->score.poseID;
+        else                               exp_snappedPoses[rollIndex] = 0;
+    }
+    if (rollIndex == func_8009BC68() - 1) {
+        // The client logs the roll when this is nonzero, then writes 0 back.
+        photosWritten = rollIndex + 1;
+        photoRollCount += 1;
+    }
+
+    // Any scoring after this (Oak's grading, the report, the album) goes to the scratch entry
+    rollIndex = 60;
+    return ret;
+}
+
+char* exp_PhotoComments[] = {
+    "ERROR",
+    "Screeching",
+    "Fighting",
+    "Happy",
+    "Relaxed",
+    "Neighing",
+    "Embers!",
+    "Embers!",
+    "Shining",
+    "Shining",
+    "Leaping!",
+    "Eating",
+    "Dragonite!",
+    "Thunder!",
+    "Happy",
+    "Looks Happy",
+    "Happy",
+    "Jolly Dance",
+    "Beautiful",
+    "Powerful",
+    "Showed Face",
+    "Scary!",
+    "Furious!",
+    "Astonished",
+    "Dancing",
+    "Shame...",
+    "Singing",
+    "Rolling",
+    "Exploded",
+    "Blast",
+    "Fainted",
+    "Pester'd",
+    "Angry",
+    "Surprised",
+    "Happy!",
+    "Going Under",
+    "Barely see",
+    "Going Under",
+    "Amaz jump",
+    "Good jump",
+    "Jumping",
+    "Falling",
+    "Falling",
+    "Fell",
+    "In the Sky",
+    "Blasted",
+    "Pester'd",
+    "Pester'd",
+    "WhataSplsh",
+    "Splashed",
+    "Good Splash",
+    "Splashing",
+    "Nice jump",
+    "Jumping",
+    "WhataJump",
+    "Dizzy",
+    "Fainted",
+    "Waking",
+    "Jumping In",
+    "Pester'd",
+    "Pester'd",
+    "Pester'd",
+    "Popping Up",
+    "Going Under",
+    "Jolly",
+    "Stumbled",
+    "Stumbled",
+    "Stumbled",
+    "Popping Up",
+    "Going Under",
+    "Happy",
+    "Good Splash",
+    "Splashing",
+    "WhataSplsh",
+    "Pester'd",
+    "Pester'd",
+    "Pester'd",
+    "Withdrawin'",
+    "In Its Shell",
+    "Coming Out",
+    "Happy!",
+    "Looks Happy",
+    "Looks Jolly",
+    "Sure is Jolly",
+    "Fun Dance",
+    "Rockin'!",
+    "Waking",
+    "Caught",
+    "Snapping",
+    "Fishing",
+    "Nice jump",
+    "Jumped",
+    "WhataJump",
+    "Falling",
+    "Unique",
+    "Submerge",
+    "Pester'd",
+    "Pester'd",
+    "Pester'd",
+    "Happy Face",
+    "Wonderful",
+    "Shocked",
+    "WhataFlame",
+    "Unstable",
+    "Hmm...",
+    "Pester'd",
+    "Happy",
+    "Dizzy",
+    "Unstable",
+    "Funny",
+    "So Funny!",
+    "Looks Hot",
+    "Falling",
+    "Fainted",
+    "Woken Up",
+    "Roaring",
+    "Pester'd",
+    "Pester'd",
+    "Pester'd",
+    "Looks Happy",
+    "ERROR",
+    "ERROR",
+    "Looks Jolly",
+    "Hit 'em!",
+    "Fainted",
+    "Waking Up",
+    "Angry",
+    "Interesting",
+    "Funny",
+    "Fainted",
+    "Pester'd",
+    "Dancing",
+    "For Sure!",
+    "Jolly Dance",
+    "Zaps Me",
+    "Lively",
+    "ERROR",
+    "ERROR",
+    "ERROR",
+    "ERROR",
+    "ERROR",
+    "ERROR",
+    "ERROR",
+    "ERROR",
+    "ERROR",
+    "PIKA!",
+    "ERROR",
+    "ERROR",
+    "ERROR",
+    "Facing...",
+    "Facing...",
+    "Well done",
+    "Spinning",
+    "Perfect!",
+    "Yummy",
+    "WeirdDance",
+    "Fishing...",
+    "Bite!",
+    "Popping Up",
+    "Barely See",
+    "Popping Up",
+    "Funny",
+    "Getting Up",
+    "Scratching",
+    0x00000000,
+};
+
+void exp_drawPhotoInfo(UnkIndigoHalibut* item) {
+    s32 rollIndex;
+    u8 pose;
+    char text[32];
+
+    func_camera_check_801DE288(item);
+    UIElement_FillRect(D_camera_check_80249910, 0, 88, 83, 106, 0, 0, 0, 0);
+    if (item == NULL) return;
+
+    rollIndex = item->unk_00 - D_800B0598; // unk_00 points into the PhotoData array
+    pose = exp_snappedPoses[rollIndex];
+    if (pose == 0) return;
+
+    UIText_SetShadowOffset(1);
+    UIText_SetSpacing(-1, 3);
+    UIElement_SetFont(D_camera_check_80249910, FONT_8);
+    
+    UIElement_SetTextPos(D_camera_check_80249910, 0, 88);
+    UIElement_PrintText(D_camera_check_80249910, "Pose");
+
+    sprintf(text, "%s", exp_PhotoComments[pose]);
+    UIElement_SetTextPos(D_camera_check_80249910, 45 - UIText_GetStringWidth(text), 98);
+    UIElement_PrintText(D_camera_check_80249910, text);
 }
